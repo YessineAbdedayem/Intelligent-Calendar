@@ -1,0 +1,5 @@
+from datetime import datetime, timedelta
+def get_current_datetime():
+    return datetime.now()
+today = get_current_datetime()
+print( today.weekday() )

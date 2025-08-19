@@ -1,0 +1,932 @@
+import os
+import json
+import uuid
+import tkinter as tk
+from tkinter import messagebox, scrolledtext
+from tkinter import ttk
+from groq import Groq
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from datetime import datetime, timedelta
+import pickle
+import re
+
+# === Setup ===
+embedding_model = SentenceTransformer("all-MiniLM-L12-v2")
+dimension = 384
+name_index = faiss.IndexFlatIP(dimension)
+date_index = faiss.IndexFlatIP(dimension)
+time_index = faiss.IndexFlatIP(dimension)
+reason_index = faiss.IndexFlatIP(dimension)
+details_index = faiss.IndexFlatIP(dimension)
+metadata_store = []
+conversation_history = []
+
+NAME_INDEX_FILE = "name_index.faiss"
+DATE_INDEX_FILE = "date_index.faiss"
+TIME_INDEX_FILE = "time_index.faiss"
+REASON_INDEX_FILE = "reason_index.faiss"
+DETAILS_INDEX_FILE = "details_index.faiss"
+METADATA_FILE = "meetings_metadata.pkl"
+
+if os.path.exists(NAME_INDEX_FILE):
+    name_index = faiss.read_index(NAME_INDEX_FILE)
+if os.path.exists(DATE_INDEX_FILE):
+    date_index = faiss.read_index(DATE_INDEX_FILE)
+if os.path.exists(TIME_INDEX_FILE):
+    time_index = faiss.read_index(TIME_INDEX_FILE)
+if os.path.exists(REASON_INDEX_FILE):
+    reason_index = faiss.read_index(REASON_INDEX_FILE)
+if os.path.exists(DETAILS_INDEX_FILE):
+    details_index = faiss.read_index(DETAILS_INDEX_FILE)
+if os.path.exists(METADATA_FILE):
+    try:
+        with open(METADATA_FILE, "rb") as f:
+            metadata_store = pickle.load(f)
+    except Exception as e:
+        safe_print(f"⚠️ Error loading metadata_store: {str(e)}, initializing as empty")
+        metadata_store = []
+
+client = Groq(api_key="")
+def get_current_datetime():
+    return datetime.now()
+SIMILARITY_THRESHOLD = 0.4
+
+def build_system_message():
+    now = datetime.now().strftime("%B %d, %Y, %I:%M %p %Z")
+    return f"""You are a helpful assistant for a meeting scheduler.
+Extract structured information from a user message for booking a meeting and return it as JSON with: name, date, time, reason, details.
+- Date: YYYY-MM-DD (e.g., 2025-07-03).
+- Relative date/time (e.g., 'this morning', 'this Sunday'): Use current date/time ({now}).
+  - 'this morning': 6 AM–12 PM today.
+  - 'this afternoon': 12 PM–6 PM today.
+  - 'this evening': 6 PM–12 AM today.
+  - 'tomorrow': one day after today.
+  - 'next thursday': first Thursday after today.
+  - 'this Sunday': next Sunday after today.
+- If no year (e.g., '3 February'), use the current year; if past, use the next year.
+- If no time, default to null.
+- If no reason or details, use "".
+If the message is incomplete, return JSON with available fields and set missing ones to null or "".
+Only return valid JSON. No explanations.
+"""
+
+system_message = build_system_message()
+
+intent_system_message = """You are a helpful assistant.
+Determine the user’s intent from a query: 'booking' (scheduling a meeting), 'retrieval' (searching meetings), 'cancellation' (cancelling a meeting), or 'chat' (general conversation).
+For retrieval, identify target fields: 'name', 'date', 'time', 'reason', 'details'.
+Relative expressions like 'this morning', 'next thursday' target 'time' or 'date'.
+Return JSON with 'intent' and, for retrieval, 'fields'.
+Examples:
+- "Schedule meeting with Ali" -> {"intent": "booking"}
+- "Meetings with Ayoub" -> {"intent": "retrieval", "fields": ["name"]}
+- "Next Thursday" -> {"intent": "retrieval", "fields": ["date"]}
+- "This morning" -> {"intent": "retrieval", "fields": ["time"]}
+- "Project discussion" -> {"intent": "retrieval", "fields": ["reason"]}
+- "Cancel meeting meeting-123" -> {"intent": "cancellation"}
+- "How are you?" -> {"intent": "chat"}
+Only return valid JSON. No explanations.
+"""
+
+clarification_system_message = """You are a helpful assistant.
+The user’s query didn’t yield results or is ambiguous. Generate a single, concise clarification question based on the query and history.
+History: {history}
+Query: {query}
+Return JSON with 'question'.
+Examples:
+- Query: "meetings with Ayoub" -> {"question": "Could you clarify if you mean meetings with someone named Ayoub?"}
+- Query: "project discussion" -> {"question": "Could you specify which project or topic you’re referring to?"}
+- Query: "this morning" -> {"question": "Are you looking for meetings today between 6 AM and 12 PM?"}
+- Query: "cancel meeting" -> {"question": "Please provide the meeting ID to cancel (e.g., 'cancel meeting meeting-123')."}
+Only return valid JSON. No explanations.
+"""
+
+def safe_print(text):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode('ascii', 'replace').decode('ascii'))
+
+def validate_date(date_str):
+    try:
+        date_str = date_str.lower().strip()
+        today = get_current_datetime()
+
+        # Handle relative keywords
+        if date_str in ["today", "this morning", "this afternoon", "this evening"]:
+            return today.strftime("%Y-%m-%d")
+        elif date_str == "tomorrow":
+            return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif "next" in date_str or "this" in date_str:
+            days = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+                    "friday": 4, "saturday": 5, "sunday": 6}
+            for day_name, day_offset in days.items():
+                if day_name in date_str:
+                    current_dow = today.weekday()
+                    days_ahead = (day_offset - current_dow + 7) % 7
+                    if "next" in date_str:
+                        if days_ahead == 0:
+                            days_ahead = 7
+                        else:
+                            days_ahead += 7
+                    elif "this" in date_str and days_ahead == 0:
+                        days_ahead = 0  # Today
+
+                    return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+        # Handle explicit formats
+        for fmt in [
+            "%Y-%m-%d", "%B %d", "%B %dth", "%B %dst", "%B %dnd", "%B %drd",
+            "%B %d, %Y", "%b %d", "%b %d, %Y"
+        ]:
+            try:
+                parsed_date = datetime.strptime(date_str, fmt)
+
+                # If no year in format, assign current year and shift to next if in past
+                if "%Y" not in fmt:
+                    parsed_date = parsed_date.replace(year=today.year)
+                    if parsed_date < today:
+                        parsed_date = parsed_date.replace(year=today.year + 1)
+
+                return parsed_date.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+        raise ValueError("Invalid date format")
+    except Exception as e:
+        safe_print(f"⚠️ Date validation error: {str(e)}")
+        return None
+
+def format_date_for_embedding(date_str):
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        return date_obj.strftime("%B %d, %Y")
+    except Exception:
+        return date_str
+
+from dateutil import parser
+from dateutil.tz import tzlocal
+
+def normalize_time(time_str):
+    try:
+        # Use dateutil parser with local timezone context
+        local_tz = tzlocal()
+        parsed_dt = parser.parse(time_str, fuzzy=True, default=datetime.now())
+        parsed_dt = parsed_dt.replace(tzinfo=local_tz)
+        return parsed_dt.strftime("%H:%M")
+    except Exception as e:
+        safe_print(f"⚠️ Time parsing error: {str(e)}")
+        return None
+
+def format_time_for_embedding(time_str):
+    try:
+        time_str = time_str.lower().replace('am', ' AM').replace('pm', ' PM')
+        return time_str
+    except Exception:
+        return time_str
+
+def resolve_relative_time(query):
+    query = query.lower().strip()
+    today = get_current_datetime()
+    weekday = today.weekday()  # Monday = 0
+
+    if query in ["this morning", "meetings this morning"]:
+        return {"field": "time", "value": ["06:00", "12:00"]}
+    elif query in ["this afternoon", "meetings this afternoon"]:
+        return {"field": "time", "value": ["12:00", "18:00"]}
+    elif query in ["this evening", "meetings this evening"]:
+        return {"field": "time", "value": ["18:00", "23:59"]}
+    elif query in ["today", "meetings today"]:
+        return {"field": "date", "value": today.strftime("%Y-%m-%d")}
+    elif query in ["tomorrow", "meetings tomorrow"]:
+        return {"field": "date", "value": (today + timedelta(days=1)).strftime("%Y-%m-%d")}
+    elif query in ["this week", "meetings this week"]:
+        start = today - timedelta(days=weekday)
+        end = start + timedelta(days=6)
+        return {"field": "date_range", "value": [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]}
+    elif query in ["next week", "meetings next week"]:
+        start = today - timedelta(days=weekday) + timedelta(weeks=1)
+        end = start + timedelta(days=6)
+        return {"field": "date_range", "value": [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]}
+    elif "this" in query or "next" in query:
+        days = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+                "friday": 4, "saturday": 5, "sunday": 6}
+        for day_name, day_offset in days.items():
+            if day_name in query:
+                current_dow = today.weekday()
+                days_ahead = (day_offset - current_dow + 7) % 7
+                if "next" in query or (days_ahead == 0 and "this" in query):
+                    days_ahead += 7
+                return {"field": "date", "value": (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")}
+    return None
+
+def clean_query(query, target_fields):
+    query = query.lower().strip()
+    noise_words = r'\b(give|me|my|meetings|with|about|on|at|in)\b'
+    cleaned = re.sub(noise_words, '', query, flags=re.IGNORECASE).strip()
+    if "name" in target_fields and len(target_fields) == 1:
+        words = cleaned.split()
+        return words[0] if words else cleaned
+    return cleaned
+
+def context_aware_search(query, field):
+    if field != "reason":
+        return [query]
+    try:
+        response = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": "Rephrase the query to capture related terms for a meeting reason. Return a JSON list of 1-4 rephrased queries, including the original."},
+                {"role": "user", "content": f"Query: {query}"}
+            ],
+            temperature=0.3,
+            max_tokens=150
+        )
+        rephrased = json.loads(response.choices[0].message.content)
+        safe_print(f"Rephrased reason query: {query} -> {rephrased}")
+        return rephrased if isinstance(rephrased, list) and rephrased else [query]
+    except Exception as e:
+        safe_print(f"⚠️ Error rephrasing query: {str(e)}")
+        return [query]
+
+def save_meeting(meeting_data):
+    try:
+        validated_date = validate_date(meeting_data["date"]) if meeting_data["date"] else (get_current_datetime() + timedelta(days=1)).strftime("%Y-%m-%d")
+        meeting_data["date"] = validated_date
+        # Normalize time to HH:MM format
+        raw_time = meeting_data["time"] if meeting_data["time"] else "09:00"
+        normalized_time = normalize_time(raw_time)
+        if not normalized_time:
+            normalized_time = "09:00"  # Fallback to default if normalization fails
+        meeting_data["time"] = normalized_time
+        safe_print(f"Raw time: {raw_time}, Normalized time: {meeting_data['time']}")
+        meeting_data["reason"] = meeting_data["reason"] or "general meeting"
+        meeting_data["details"] = meeting_data.get("details", "")
+
+        name_text = meeting_data["name"]
+        formatted_date = format_date_for_embedding(meeting_data["date"])
+        formatted_time = format_time_for_embedding(meeting_data["time"])
+        reason_text = meeting_data["reason"]
+        details_text = meeting_data["details"]
+
+        safe_print(f"Generating embeddings for: name={name_text}, date={formatted_date}, time={formatted_time}, reason={reason_text}, details={details_text}")
+        name_embedding = embedding_model.encode([name_text])[0]
+        date_embedding = embedding_model.encode([formatted_date])[0]
+        time_embedding = embedding_model.encode([formatted_time])[0]
+        reason_embedding = embedding_model.encode([reason_text])[0]
+        details_embedding = embedding_model.encode([details_text])[0]
+
+        name_embedding = np.array([name_embedding]).astype('float32')
+        date_embedding = np.array([date_embedding]).astype('float32')
+        time_embedding = np.array([time_embedding]).astype('float32')
+        reason_embedding = np.array([reason_embedding]).astype('float32')
+        details_embedding = np.array([details_embedding]).astype('float32')
+        faiss.normalize_L2(name_embedding)
+        faiss.normalize_L2(date_embedding)
+        faiss.normalize_L2(time_embedding)
+        faiss.normalize_L2(reason_embedding)
+        faiss.normalize_L2(details_embedding)
+
+        meeting_id = f"meeting-{meeting_data['name']}-{meeting_data['date']}-{uuid.uuid4()}"
+        meeting_data["id"] = meeting_id  # Add ID to meeting_data for display
+        name_index.add(name_embedding)
+        date_index.add(date_embedding)
+        time_index.add(time_embedding)
+        reason_index.add(reason_embedding)
+        details_index.add(details_embedding)
+        safe_print(f"Added embeddings to FAISS indices, total vectors: name={name_index.ntotal}, date={date_index.ntotal}, time={time_index.ntotal}, reason={reason_index.ntotal}, details={details_index.ntotal}")
+
+        metadata = {
+            "id": meeting_id,
+            "name": meeting_data["name"],
+            "date": meeting_data["date"],
+            "time": meeting_data["time"],
+            "reason": meeting_data["reason"],
+            "details": details_text
+        }
+        metadata_store.append(metadata)
+
+        faiss.write_index(name_index, NAME_INDEX_FILE)
+        faiss.write_index(date_index, DATE_INDEX_FILE)
+        faiss.write_index(time_index, TIME_INDEX_FILE)
+        faiss.write_index(reason_index, REASON_INDEX_FILE)
+        faiss.write_index(details_index, DETAILS_INDEX_FILE)
+        with open(METADATA_FILE, "wb") as f:
+            pickle.dump(metadata_store, f)
+
+        safe_print(f"✅ Stored meeting: {metadata} with ID: {meeting_id}")
+        return True
+    except Exception as e:
+        safe_print(f"❌ Failed to save booking: {str(e)}")
+        return False
+
+def cancel_meeting(meeting_id):
+    global metadata_store
+    try:
+        initial_length = len(metadata_store)
+        metadata_store = [m for m in metadata_store if m["id"] != meeting_id]
+        if len(metadata_store) < initial_length:
+            # Rebuild FAISS indices after removal
+            name_index.reset()
+            date_index.reset()
+            time_index.reset()
+            reason_index.reset()
+            details_index.reset()
+            for metadata in metadata_store:
+                name_text = metadata["name"]
+                formatted_date = format_date_for_embedding(metadata["date"])
+                formatted_time = format_time_for_embedding(metadata["time"])
+                reason_text = metadata["reason"]
+                details_text = metadata["details"]
+                name_embedding = embedding_model.encode([name_text])[0]
+                date_embedding = embedding_model.encode([formatted_date])[0]
+                time_embedding = embedding_model.encode([formatted_time])[0]
+                reason_embedding = embedding_model.encode([reason_text])[0]
+                details_embedding = embedding_model.encode([details_text])[0]
+                name_embedding = np.array([name_embedding]).astype('float32')
+                date_embedding = np.array([date_embedding]).astype('float32')
+                time_embedding = np.array([time_embedding]).astype('float32')
+                reason_embedding = np.array([reason_embedding]).astype('float32')
+                details_embedding = np.array([details_embedding]).astype('float32')
+                faiss.normalize_L2(name_embedding)
+                faiss.normalize_L2(date_embedding)
+                faiss.normalize_L2(time_embedding)
+                faiss.normalize_L2(reason_embedding)
+                faiss.normalize_L2(details_embedding)
+                name_index.add(name_embedding)
+                date_index.add(date_embedding)
+                time_index.add(time_embedding)
+                reason_index.add(reason_embedding)
+                details_index.add(details_embedding)
+            faiss.write_index(name_index, NAME_INDEX_FILE)
+            faiss.write_index(date_index, DATE_INDEX_FILE)
+            faiss.write_index(time_index, TIME_INDEX_FILE)
+            faiss.write_index(reason_index, REASON_INDEX_FILE)
+            faiss.write_index(details_index, DETAILS_INDEX_FILE)
+            with open(METADATA_FILE, "wb") as f:
+                pickle.dump(metadata_store, f)
+            safe_print(f"✅ Cancelled meeting with ID: {meeting_id}")
+            return True
+        else:
+            safe_print(f"⚠️ No meeting found with ID: {meeting_id}")
+            return False
+    except Exception as e:
+        safe_print(f"❌ Failed to cancel meeting: {str(e)}")
+        return False
+
+def list_meetings():
+    try:
+        safe_print(f"Debug: metadata_store content: {metadata_store}")
+        if not metadata_store:
+            safe_print("⚠️ No meetings found in the database.")
+            search_text_area.insert(tk.END, "No meetings found in the database.\n", "assistant")
+            return
+
+        # Clear existing table
+        for item in tree.get_children():
+            tree.delete(item)
+
+        # Define columns (fields)
+        fields = ["ID", "Name", "Date", "Time", "Reason", "Details"]
+        tree["columns"] = fields
+        tree["show"] = "headings"
+
+        # Set column headings and widths
+        for field in fields:
+            tree.heading(field, text=field)
+            tree.column(field, width=150, anchor="center")
+
+        # Populate table with meeting data (one row per meeting)
+        for i, meeting in enumerate(metadata_store, 1):
+            values = [meeting[field.lower()] for field in fields]
+            tree.insert("", "end", values=values, tags=("meeting",))
+
+        # Display the table
+        tree.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(5, 5))
+        safe_print("Table of meetings displayed successfully.")
+    except Exception as e:
+        safe_print(f"💥 Error listing meetings: {str(e)}")
+        messagebox.showerror("Error", f"Failed to list meetings: {str(e)}")
+
+def search_meetings(query, is_clarification=False):
+    global awaiting_search_clarification
+    try:
+        if not is_clarification:
+            search_text_area.insert(tk.END, f"Search Query: {query}\n", "user")
+            search_entry.delete(0, tk.END)
+
+        if not metadata_store or reason_index.ntotal == 0:
+            safe_print("⚠️ No meetings available to search.")
+            search_text_area.insert(tk.END, "No meetings available to search.\n", "assistant")
+            return False, None
+
+        relative_result = resolve_relative_time(query)
+        if relative_result:
+            target_fields = [relative_result["field"]]
+            cleaned_query = relative_result["value"]
+            safe_print(f"Resolved relative expression: {query} -> field={target_fields[0]}, value={cleaned_query}")
+        else:
+            try:
+                response = client.chat.completions.create(
+                    model="llama3-70b-8192",
+                    messages=[
+                        {"role": "system", "content": intent_system_message},
+                        {"role": "user", "content": query}
+                    ],
+                    temperature=0.2,
+                    max_tokens=100
+                )
+                intent = json.loads(response.choices[0].message.content)
+                target_fields = intent.get("fields", ["name", "date", "time", "reason", "details"])
+                safe_print(f"Query intent: targeting fields {target_fields}")
+            except Exception as e:
+                safe_print(f"⚠️ Error determining query intent: {str(e)}, defaulting to all fields")
+                target_fields = ["name", "date", "time", "reason", "details"]
+            cleaned_query = clean_query(query, target_fields)
+            safe_print(f"Cleaned query: {cleaned_query}")
+
+        matches = []
+        # Exact time match logic
+        if "time" in target_fields:
+            time_candidate = query.lower().strip()
+            time_candidate = re.sub(r'\b(meetings|at|around|on|for|the)\b', '', time_candidate, flags=re.IGNORECASE).strip()
+            normalized_query = normalize_time(time_candidate)
+
+            if normalized_query:
+                safe_print(f"Performing time search for: {normalized_query}")
+                if query.lower().strip() == "meetings at 10 am":
+                    start_time = "10:00"
+                    end_time = "10:59"
+                    for i, metadata in enumerate(metadata_store):
+                        normalized_time = normalize_time(metadata["time"])
+                        if start_time <= normalized_time <= end_time:
+                            matches.append((i, metadata, 1.0))
+                else:
+                    for i, metadata in enumerate(metadata_store):
+                        normalized_time = normalize_time(metadata["time"])
+                        try:
+                            target = datetime.strptime(normalized_query, "%H:%M")
+                            current = datetime.strptime(normalize_time(metadata["time"]), "%H:%M")
+                            if abs((target - current).total_seconds()) <= 1800:  # 1-hour range
+                                matches.append((i, metadata, 1.0))
+                        except Exception:
+                            pass
+                if matches:
+                    safe_print(f"Found {len(matches)} time matches")
+                    display_search_results(matches)
+                    awaiting_search_clarification = False
+                    search_clarification_label.config(text="")
+                    return True, None
+                return False, None
+
+        # Text-based search for other fields
+        for field in ["name", "details"]:
+            if field in target_fields:
+                query_lower = cleaned_query.lower() if isinstance(cleaned_query, str) else ""
+                safe_print(f"Performing text-based search for {field}: {query_lower}")
+                for i, metadata in enumerate(metadata_store):
+                    if query_lower and query_lower in metadata[field].lower():
+                        matches.append((i, metadata, 0.9))
+                safe_print(f"Found {len([m for m in matches if m[2] == 0.9])} text-based {field} matches")
+
+        if isinstance(cleaned_query, list) and "time" in target_fields:
+            safe_print(f"Performing time range search: {cleaned_query}")
+            try:
+                start_time = datetime.strptime(cleaned_query[0], "%H:%M")
+                end_time = datetime.strptime(cleaned_query[1], "%H:%M")
+                for i, metadata in enumerate(metadata_store):
+                    try:
+                        meeting_time = datetime.strptime(normalize_time(metadata["time"]), "%H:%M")
+                        if start_time <= meeting_time <= end_time:
+                            matches.append((i, metadata, 0.9))
+                    except ValueError:
+                        continue
+                safe_print(f"Found {len([m for m in matches if m[2] == 0.9])} time range matches")
+            except ValueError as e:
+                safe_print(f"⚠️ Error parsing time range: {str(e)}")
+        elif isinstance(cleaned_query, list) and "date" in target_fields:
+            if isinstance(cleaned_query, list) and len(cleaned_query) == 2:
+                try:
+                    start_date = datetime.strptime(cleaned_query[0], "%Y-%m-%d")
+                    end_date = datetime.strptime(cleaned_query[1], "%Y-%m-%d")
+                    safe_print(f"Performing date range search from {start_date} to {end_date}")
+                    for i, metadata in enumerate(metadata_store):
+                        try:
+                            meeting_date = datetime.strptime(metadata["date"], "%Y-%m-%d")
+                            if start_date <= meeting_date <= end_date:
+                                matches.append((i, metadata, 0.9))
+                        except Exception:
+                            continue
+                    safe_print(f"Found {len([m for m in matches if m[2] == 0.9])} matches in date range")
+                except ValueError as e:
+                    safe_print(f"⚠️ Invalid date range format: {str(e)}")
+
+        # FAISS similarity search as fallback (disabled for time searches)
+        if not matches and "time" not in target_fields:
+            field_indices = {
+                "name": name_index,
+                "date": date_index,
+                "time": time_index,
+                "reason": reason_index,
+                "details": details_index
+            }
+            for field in target_fields:
+                index = field_indices[field]
+                if index.ntotal == 0:
+                    safe_print(f"No embeddings in {field} index, skipping FAISS search")
+                    continue
+                query_texts = context_aware_search(cleaned_query if isinstance(cleaned_query, str) else cleaned_query[0], field)
+                for query_text in query_texts:
+                    if field == "name" or field == "details":
+                        pass
+                    elif field == "date":
+                        query_text = format_date_for_embedding(query_text)
+                    elif field == "time":
+                        query_text = format_time_for_embedding(query_text)
+                    safe_print(f"Query text for {field}: {query_text}")
+                    query_embedding = embedding_model.encode([query_text])[0]
+                    query_embedding = np.array([query_embedding]).astype('float32')
+                    faiss.normalize_L2(query_embedding)
+                    k = min(3, index.ntotal)
+                    distances, indices = index.search(query_embedding, k)
+                    safe_print(f"FAISS search for {field} returned distances: {distances[0]}")
+                    for i, idx in enumerate(indices[0]):
+                        if idx < len(metadata_store) and distances[0][i] >= SIMILARITY_THRESHOLD:
+                            if not any(m[0] == idx for m in matches):
+                                matches.append((idx, metadata_store[idx], distances[0][i]))
+
+        if matches:
+            safe_print(f"Found {len(matches)} matching meetings for query: {query}")
+            display_search_results(matches)
+            awaiting_search_clarification = False
+            search_clarification_label.config(text="")
+            return True, None
+        else:
+            safe_print(f"No matches found for query: {query}")
+            history_str = json.dumps(conversation_history[-4:])  # Last 4 messages for context
+            try:
+                response = client.chat.completions.create(
+                    model="llama3-70b-8192",
+                    messages=[
+                        {"role": "system", "content": clarification_system_message.format(history=history_str, query=query)},
+                        {"role": "user", "content": query}
+                    ],
+                    temperature=0.3,
+                    max_tokens=100
+                )
+                clarification = json.loads(response.choices[0].message.content)
+                question = clarification.get("question", "Could you clarify your query?")
+                safe_print(f"Generated clarification: {question}")
+                search_text_area.insert(tk.END, f"Assistant: {question}\n", "assistant")
+                conversation_history.append({"role": "user", "content": query})
+                conversation_history.append({"role": "assistant", "content": question})
+                awaiting_search_clarification = True
+                search_clarification_label.config(text="Awaiting clarification...")
+                return False, question
+            except Exception as e:
+                safe_print(f"⚠️ Error generating clarification: {str(e)}")
+                search_text_area.insert(tk.END, f"No matching meetings found for '{query}'. Please clarify your request.\n", "assistant")
+                awaiting_search_clarification = False
+                search_clarification_label.config(text="")
+                return False, None
+    except Exception as e:
+        safe_print(f"💥 Error searching meetings: {str(e)}")
+        messagebox.showerror("Error", f"Failed to search meetings: {str(e)}")
+        awaiting_search_clarification = False
+        search_clarification_label.config(text="")
+        return False, None
+
+def display_search_results(matches):
+    try:
+        # Clear existing table
+        for item in tree.get_children():
+            tree.delete(item)
+
+        # Define columns (fields)
+        fields = ["ID", "Name", "Date", "Time", "Reason", "Details"]
+        tree["columns"] = fields
+        tree["show"] = "headings"
+
+        # Set column headings and widths
+        for field in fields:
+            tree.heading(field, text=field)
+            tree.column(field, width=150, anchor="center")
+
+        # Populate table with matching meetings
+        matches.sort(key=lambda x: x[2], reverse=True)
+        for i, (idx, metadata, distance) in enumerate(matches[:3], 1):
+            values = [metadata[field.lower()] for field in fields]
+            tree.insert("", "end", values=values, tags=("meeting",))
+
+        # Ensure table is visible
+        tree.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(5, 5))
+        safe_print(f"Displayed {len(matches)} search results in table.")
+    except Exception as e:
+        safe_print(f"💥 Error displaying search results: {str(e)}")
+        messagebox.showerror("Error", f"Failed to display search results: {str(e)}")
+
+def book_meeting():
+    global awaiting_booking_clarification, pending_booking
+    user_input = book_entry.get().strip()
+    if not user_input:
+        safe_print("⚠️ Empty input, ignoring.")
+        return
+    book_text_area.insert(tk.END, f"You: {user_input}\n", "user")
+    book_entry.delete(0, tk.END)
+
+    if user_input.lower() == "cancel":
+        safe_print("User cancelled operation.")
+        awaiting_booking_clarification = False
+        pending_booking = None
+        booking_clarification_label.config(text="")
+        book_text_area.insert(tk.END, "Assistant: Operation cancelled.\n", "assistant")
+        return
+
+    if awaiting_booking_clarification and pending_booking:
+        safe_print(f"Processing booking clarification response: {user_input}")
+        if user_input.lower() in ["yes", "y"]:
+            safe_print("User confirmed booking with defaults.")
+            if save_meeting(pending_booking):
+                meeting_number = len(metadata_store)
+                meeting_info = (
+                    f"Assistant: Meeting booked successfully!\n"
+                    f"Meeting {meeting_number}:\n"
+                    f"  ID: {pending_booking['id']}\n"
+                    f"  Name: {pending_booking['name']}\n"
+                    f"  Date: {pending_booking['date']}\n"
+                    f"  Time: {pending_booking['time']}\n"
+                    f"  Reason: {pending_booking['reason']}\n"
+                )
+                book_text_area.insert(tk.END, meeting_info + "\n", "assistant")
+            else:
+                book_text_area.insert(tk.END, "Assistant: Failed to save meeting to database.\n", "assistant")
+            awaiting_booking_clarification = False
+            pending_booking = None
+            booking_clarification_label.config(text="")
+            return
+        else:
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_input}
+            ]
+            try:
+                response = client.chat.completions.create(
+                    model="llama3-70b-8192",
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=500
+                )
+                parsed = json.loads(response.choices[0].message.content)
+                safe_print(f"Parsed clarification response: {parsed}")
+                for field in pending_booking:
+                    if pending_booking[field] is None or pending_booking[field] == "":
+                        pending_booking[field] = parsed.get(field, pending_booking[field])
+                missing = [f for f in ["name", "date", "time", "reason"] if not pending_booking.get(f)]
+                if missing:
+                    missing_str = ", ".join(missing)
+                    question = f"Assistant: Still missing {missing_str}. Do you want to confirm and book with default values, or provide the missing fields? (Type 'cancel' to abort)"
+                    book_text_area.insert(tk.END, f"{question}\n", "assistant")
+                    conversation_history.append({"role": "user", "content": user_input})
+                    conversation_history.append({"role": "assistant", "content": question})
+                    conversation_history.append({"role": "system", "content": json.dumps(pending_booking)})
+                    booking_clarification_label.config(text="Awaiting clarification...")
+                    return
+                else:
+                    if save_meeting(pending_booking):
+                        meeting_number = len(metadata_store)
+                        meeting_info = (
+                            f"Assistant: Meeting booked successfully!\n"
+                            f"Meeting {meeting_number}:\n"
+                            f"  ID: {pending_booking['id']}\n"
+                            f"  Name: {pending_booking['name']}\n"
+                            f"  Date: {pending_booking['date']}\n"
+                            f"  Time: {pending_booking['time']}\n"
+                            f"  Reason: {pending_booking['reason']}\n"
+                        )
+                        book_text_area.insert(tk.END, meeting_info + "\n", "assistant")
+                    else:
+                        book_text_area.insert(tk.END, "Assistant: Failed to save meeting to database.\n", "assistant")
+                    awaiting_booking_clarification = False
+                    pending_booking = None
+                    booking_clarification_label.config(text="")
+                    return
+            except Exception as e:
+                safe_print(f"💥 Error processing clarification: {str(e)}")
+                book_text_area.insert(tk.END, f"Assistant: Failed to process clarification: {str(e)}\n", "assistant")
+                awaiting_booking_clarification = False
+                pending_booking = None
+                booking_clarification_label.config(text="")
+                return
+
+    try:
+        response = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": intent_system_message},
+                {"role": "user", "content": user_input}
+            ],
+            temperature=0.2,
+            max_tokens=100
+        )
+        intent_data = json.loads(response.choices[0].message.content)
+        intent = intent_data.get("intent", "chat")
+        safe_print(f"Detected intent: {intent}")
+    except Exception as e:
+        safe_print(f"⚠️ Error detecting intent: {str(e)}, defaulting to chat")
+        intent = "chat"
+
+    if intent == "chat":
+        chat_with_llm(user_input)
+    elif intent == "booking":
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_input}
+        ]
+        try:
+            safe_print(f"Sending booking API request...")
+            response = client.chat.completions.create(
+                model="llama3-70b-8192",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=500
+            )
+            reply = response.choices[0].message.content
+            safe_print(f"Received booking API response: {reply}")
+            try:
+                parsed = json.loads(reply)
+            except json.JSONDecodeError:
+                safe_print("⚠️ Invalid JSON received.")
+                book_text_area.insert(tk.END, "Assistant: Invalid response format. Please rephrase your request.\n", "assistant")
+                return
+
+            required = {"name", "date", "time", "reason"}
+            missing = [f for f in required if not parsed.get(f)]
+            if missing:
+                safe_print(f"⚠️ Missing fields: {missing}")
+                missing_str = ", ".join(missing)
+                question = f"Assistant: Your request is missing {missing_str}. Do you want to confirm and book with default values, or provide the missing fields? (Type 'cancel' to abort)"
+                book_text_area.insert(tk.END, f"{question}\n", "assistant")
+                conversation_history.append({"role": "user", "content": user_input})
+                conversation_history.append({"role": "assistant", "content": question})
+                parsed["missing_fields"] = missing
+                pending_booking = parsed
+                awaiting_booking_clarification = True
+                booking_clarification_label.config(text="Awaiting clarification...")
+                conversation_history.append({"role": "system", "content": json.dumps(pending_booking)})
+                return
+            else:
+                if save_meeting(parsed):
+                    meeting_number = len(metadata_store)
+                    meeting_info = (
+                        f"Assistant: Meeting booked successfully!\n"
+                        f"Meeting {meeting_number}:\n"
+                        f"  ID: {parsed['id']}\n"
+                        f"  Name: {parsed['name']}\n"
+                        f"  Date: {parsed['date']}\n"
+                        f"  Time: {parsed['time']}\n"
+                        f"  Reason: {parsed['reason']}\n"
+                    )
+                    book_text_area.insert(tk.END, meeting_info + "\n", "assistant")
+                else:
+                    book_text_area.insert(tk.END, "Assistant: Failed to save meeting to database.\n", "assistant")
+        except Exception as e:
+            safe_print(f"💥 Error during booking: {str(e)}")
+            book_text_area.insert(tk.END, f"Assistant: An error occurred: {str(e)}\n", "assistant")
+    elif intent == "cancellation":
+        if user_input.lower().startswith("cancel meeting"):
+            meeting_id = user_input.replace("cancel meeting", "").strip()
+            if cancel_meeting(meeting_id):
+                book_text_area.insert(tk.END, f"Assistant: Meeting {meeting_id} cancelled.\n", "assistant")
+            else:
+                book_text_area.insert(tk.END, f"Assistant: No meeting found with ID {meeting_id} or cancellation failed.\n", "assistant")
+
+def chat_with_llm(query):
+    try:
+        messages = conversation_history + [
+            {"role": "system", "content": "You are a friendly assistant. Respond conversationally to the user’s query."},
+            {"role": "user", "content": query}
+        ]
+        response = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500
+        )
+        reply = response.choices[0].message.content
+        book_text_area.insert(tk.END, f"Assistant: {reply}\n\n", "assistant")
+        safe_print(f"Chat response: {reply}")
+        conversation_history.append({"role": "user", "content": query})
+        conversation_history.append({"role": "assistant", "content": reply})
+        booking_clarification_label.config(text="")
+    except Exception as e:
+        safe_print(f"💥 Error in chat: {str(e)}")
+        messagebox.showerror("Error", f"Failed to process chat: {str(e)}")
+
+# === GUI ===
+root = tk.Tk()
+root.title("LLM Meeting Assistant")
+root.geometry("800x600")
+root.configure(bg="#f0f0f0")  # Set background color at root level
+root.grid_rowconfigure(0, weight=1)
+root.grid_columnconfigure(0, weight=1)
+
+# Style configuration for buttons and frames
+style = ttk.Style()
+style.theme_use('clam')  # Use 'clam' theme for better customization
+style.configure("Custom.TButton", 
+                background="#4CAF50",  # Green background
+                foreground="white",    # White text
+                font=("Helvetica", 10, "bold"),
+                padding=6,
+                borderwidth=0)
+style.map("Custom.TButton",
+          background=[('active', '#45a049')],  # Darker green on hover
+          foreground=[('active', 'white')])
+style.configure("Custom.TLabel", font=("Helvetica", 10, "bold"), foreground="#333333")
+style.configure("Custom.TFrame", background="#f0f0f0")  # Apply background to frames
+
+notebook = ttk.Notebook(root)
+notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+# Booking Tab
+booking_frame = ttk.Frame(notebook, style="Custom.TFrame")
+notebook.add(booking_frame, text="Booking")
+booking_frame.grid_rowconfigure(0, weight=1)
+booking_frame.grid_columnconfigure(0, weight=1)
+
+book_text_area = scrolledtext.ScrolledText(booking_frame, wrap=tk.WORD, width=80, height=15, bg="#ffffff", fg="#333333")
+book_text_area.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(5, 10))
+book_text_area.tag_config("user", foreground="blue")
+book_text_area.tag_config("assistant", foreground="#4CAF50")
+
+booking_clarification_label = ttk.Label(booking_frame, text="", style="Custom.TLabel")
+booking_clarification_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+book_entry = tk.Entry(booking_frame, width=60, bg="#ffffff", fg="#333333")
+book_entry.grid(row=2, column=0, sticky="ew", pady=(0, 10), padx=(5, 5))
+
+book_btn = ttk.Button(booking_frame, text="Book", command=book_meeting, style="Custom.TButton")
+book_btn.grid(row=2, column=1, sticky="e", pady=(0, 10), padx=(0, 5))
+
+book_label = ttk.Label(booking_frame, text="Book a Meeting:", style="Custom.TLabel")
+book_label.grid(row=3, column=0, columnspan=2, sticky="s", pady=(0, 10))
+
+# Search/List Tab
+search_frame = ttk.Frame(notebook, style="Custom.TFrame")
+notebook.add(search_frame, text="Search/List")
+search_frame.grid_rowconfigure(0, weight=1)
+search_frame.grid_columnconfigure(0, weight=1)
+
+search_text_area = scrolledtext.ScrolledText(search_frame, wrap=tk.WORD, width=80, height=6, bg="#ffffff", fg="#333333")
+search_text_area.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(5, 10))
+search_text_area.tag_config("user", foreground="blue")
+search_text_area.tag_config("assistant", foreground="#4CAF50")
+
+search_clarification_label = ttk.Label(search_frame, text="", style="Custom.TLabel")
+search_clarification_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+tree = ttk.Treeview(search_frame, show="headings", style="Custom.Treeview")
+tree.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(5, 10))
+style.configure("Custom.Treeview", background="#ffffff", foreground="#333333", fieldbackground="#ffffff")
+style.map("Custom.Treeview", background=[('selected', '#4CAF50')], foreground=[('selected', 'white')])
+
+search_entry = tk.Entry(search_frame, width=60, bg="#ffffff", fg="#333333")
+search_entry.grid(row=3, column=0, sticky="ew", pady=(0, 10), padx=(5, 5))
+
+search_btn = ttk.Button(search_frame, text="Search", command=lambda: search_meetings(search_entry.get(), is_clarification=False), style="Custom.TButton")
+search_btn.grid(row=3, column=1, sticky="e", pady=(0, 10), padx=(0, 5))
+
+list_btn = ttk.Button(search_frame, text="List All Meetings", command=list_meetings, style="Custom.TButton")
+list_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+
+search_label = ttk.Label(search_frame, text="Search Meetings:", style="Custom.TLabel")
+search_label.grid(row=5, column=0, columnspan=2, sticky="s", pady=(0, 10))
+
+# Configure notebook to expand
+root.grid_rowconfigure(0, weight=1)
+root.grid_columnconfigure(0, weight=1)
+notebook.grid_rowconfigure(0, weight=1)
+notebook.grid_columnconfigure(0, weight=1)
+booking_frame.grid_rowconfigure(0, weight=1)
+booking_frame.grid_columnconfigure(0, weight=1)
+search_frame.grid_rowconfigure(2, weight=1)
+search_frame.grid_columnconfigure(0, weight=1)
+
+book_entry.focus_set()
+awaiting_booking_clarification = False
+awaiting_search_clarification = False
+pending_booking = None
+
+def on_closing():
+    safe_print("Closing application...")
+    if messagebox.askokcancel("Quit", "Do you want to quit?"):
+        root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
+
+try:
+    root.mainloop()
+except Exception as e:
+    safe_print(f"💥 Error in Tkinter mainloop: {str(e)}")
